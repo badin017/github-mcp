@@ -6,11 +6,14 @@ with GitHub Enterprise (anbgithub.com) via Server-Sent Events.
 
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
 import re
 import uuid
+import zipfile
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
@@ -48,8 +51,16 @@ mcp_server = Server("github-mcp")
 sse_transport = SseServerTransport("/messages/")
 
 # ---------------------------------------------------------------------------
-# GitHub API helper
+# GitHub API helper (shared client for connection pooling)
 # ---------------------------------------------------------------------------
+
+_http_client: httpx.AsyncClient | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    if _http_client is None:
+        raise RuntimeError("HTTP client not initialised — server not started yet.")
+    return _http_client
 
 
 def _auth_headers() -> dict:
@@ -59,12 +70,16 @@ def _auth_headers() -> dict:
     }
 
 
-async def github_api(method: str, path: str, **kwargs) -> httpx.Response:
+async def github_api(
+    method: str, path: str, *, extra_headers: dict | None = None, **kwargs
+) -> httpx.Response:
     """Authenticated request to the GitHub Enterprise REST API."""
     url = f"{GITHUB_BASE_URL}{path}"
     logger.info("GitHub API  %s %s", method, path)
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.request(method, url, headers=_auth_headers(), **kwargs)
+    headers = _auth_headers()
+    if extra_headers:
+        headers.update(extra_headers)
+    resp = await _get_client().request(method, url, headers=headers, **kwargs)
 
     if resp.status_code == 401:
         raise RuntimeError(
@@ -575,7 +590,11 @@ async def _clone_repository(args: dict) -> list[TextContent]:
 
     clone_url = f"https://{GITHUB_TOKEN}@{GITHUB_HOST}/{repo_name}.git"
     dest.parent.mkdir(parents=True, exist_ok=True)
-    Repo.clone_from(clone_url, str(dest))
+    try:
+        await asyncio.to_thread(Repo.clone_from, clone_url, str(dest))
+    except Exception as exc:
+        sanitised = str(exc).replace(GITHUB_TOKEN, "***")
+        raise RuntimeError(f"Clone failed for {repo_name}: {sanitised}") from None
     logger.info("Cloned %s -> %s", repo_name, dest)
     return [TextContent(type="text", text=f"Cloned {repo_name} to {dest}")]
 
@@ -589,16 +608,18 @@ async def _get_repo_rules(args: dict) -> list[TextContent]:
         resp = await github_api("GET", f"/repos/{owner}/{repo}/rulesets")
         rulesets = resp.json()
         lines.append(f"Rulesets ({len(rulesets)}):")
-        for rs in rulesets:
+
+        details = await asyncio.gather(*(
+            github_api("GET", f"/repos/{owner}/{repo}/rulesets/{rs['id']}")
+            for rs in rulesets
+        ))
+
+        for rs, detail_resp in zip(rulesets, details):
             lines.append(
                 f"  - {rs.get('name', 'unnamed')}  "
                 f"enforcement={rs.get('enforcement')}"
             )
-            detail = (
-                await github_api(
-                    "GET", f"/repos/{owner}/{repo}/rulesets/{rs['id']}"
-                )
-            ).json()
+            detail = detail_resp.json()
             for rule in detail.get("rules", []):
                 lines.append(f"    rule: {rule.get('type')}")
                 if rule.get("parameters"):
@@ -1001,6 +1022,7 @@ async def _monitor_workflow_status(args: dict) -> list[TextContent]:
 
     elapsed = 0
     current_interval = interval
+    status = "unknown"
     updates: list[str] = []
 
     while elapsed < max_wait:
@@ -1307,6 +1329,7 @@ async def _search_enterprise_codebase(args: dict) -> list[TextContent]:
         await github_api(
             "GET",
             "/search/code",
+            extra_headers={"Accept": "application/vnd.github.text-match+json"},
             params={"q": full_query, "per_page": per_page},
         )
     ).json()
@@ -1584,14 +1607,16 @@ async def _download_workflow_artifact(args: dict) -> list[TextContent]:
         f"/repos/{owner}/{repo}/actions/artifacts/{target['id']}/zip",
     )
 
-    # Write and extract
-    import io
-    import zipfile
-
-    dest = Path(output_dir)
+    dest = Path(output_dir).resolve()
     dest.mkdir(parents=True, exist_ok=True)
 
     with zipfile.ZipFile(io.BytesIO(download_resp.content)) as zf:
+        for member in zf.namelist():
+            member_path = (dest / member).resolve()
+            if not member_path.is_relative_to(dest):
+                raise RuntimeError(
+                    f"Zip path traversal blocked: {member}"
+                )
         zf.extractall(dest)
 
     extracted = [str(p.relative_to(dest)) for p in dest.rglob("*") if p.is_file()]
@@ -1706,7 +1731,16 @@ async def _get_deployment_status(args: dict) -> list[TextContent]:
         f"Deployments to '{environment}' ({len(deployments)} most recent):"
     ]
 
-    for dep in deployments:
+    status_responses = await asyncio.gather(*(
+        github_api(
+            "GET",
+            f"/repos/{owner}/{repo}/deployments/{dep['id']}/statuses",
+            params={"per_page": 1},
+        )
+        for dep in deployments
+    ))
+
+    for dep, status_resp in zip(deployments, status_responses):
         dep_id = dep["id"]
         ref = dep.get("ref", "?")
         sha = dep.get("sha", "?")[:7]
@@ -1714,15 +1748,7 @@ async def _get_deployment_status(args: dict) -> list[TextContent]:
         created = dep.get("created_at", "?")[:19].replace("T", " ")
         description = dep.get("description") or ""
 
-        # Fetch the latest status for this deployment
-        statuses = (
-            await github_api(
-                "GET",
-                f"/repos/{owner}/{repo}/deployments/{dep_id}/statuses",
-                params={"per_page": 1},
-            )
-        ).json()
-
+        statuses = status_resp.json()
         if statuses:
             state = statuses[0].get("state", "?")
             status_desc = statuses[0].get("description", "")
@@ -1787,7 +1813,21 @@ async def call_tool(name: str, arguments: dict):
 # ---------------------------------------------------------------------------
 # FastAPI application + MCP SSE transport
 # ---------------------------------------------------------------------------
-app = FastAPI(title="GitHub Enterprise MCP Server")
+
+
+@asynccontextmanager
+async def _lifespan(application: FastAPI):
+    global _http_client
+    _http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(30.0, connect=10.0),
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+    )
+    yield
+    await _http_client.aclose()
+    _http_client = None
+
+
+app = FastAPI(title="GitHub Enterprise MCP Server", lifespan=_lifespan)
 
 
 @app.get("/health")
